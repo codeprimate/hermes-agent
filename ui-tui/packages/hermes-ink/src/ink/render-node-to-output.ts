@@ -586,12 +586,19 @@ function renderNodeToOutput(
 
         let text: string
         let softWrap: boolean[] | undefined
+        let wrappedPlain: string
+        let charToSegmentForFragments: number[]
+        let trimEnabledForFragments = false
 
         if (needsWrapping && segments.length === 1) {
           // Single segment: wrap plain text first, then apply styles to each line
           const segment = segments[0]!
           const w = wrapWithSoftWrap(plainText, maxWidth, textWrap)
           softWrap = w.softWrap
+          wrappedPlain = w.wrapped
+          trimEnabledForFragments = textWrap === 'wrap-trim'
+          // Single-segment case: every char in the wrapped output maps to segment 0.
+          charToSegmentForFragments = new Array(plainText.length).fill(0)
           text = w.wrapped
             .split('\n')
             .map(line => {
@@ -614,12 +621,17 @@ function renderNodeToOutput(
           // per-segment styles even when text wraps across lines.
           const w = wrapWithSoftWrap(plainText, maxWidth, textWrap)
           softWrap = w.softWrap
+          wrappedPlain = w.wrapped
+          trimEnabledForFragments = textWrap === 'wrap-trim'
           const charToSegment = buildCharToSegmentMap(segments)
+          charToSegmentForFragments = charToSegment
           text = applyStylesToWrappedText(w.wrapped, segments, charToSegment, plainText, textWrap === 'wrap-trim')
           // Hyperlinks are handled per-run in applyStylesToWrappedText via
           // wrapWithOsc8Link, similar to how styles are applied per-run.
         } else {
           // No wrapping needed: apply styles directly
+          wrappedPlain = plainText
+          charToSegmentForFragments = buildCharToSegmentMap(segments)
           text = segments
             .map(segment => {
               let styledText = applyTextStyles(segment.text, segment.styles)
@@ -643,7 +655,13 @@ function renderNodeToOutput(
         // across visual rows). Stored on the node directly so the
         // generic `nodeCache.set` at the end of renderNodeToOutput
         // picks it up.
-        const segmentFragments = computeSegmentFragments(segments, softWrap)
+        const segmentFragments = computeFragmentsForWrappedText(
+          wrappedPlain,
+          segments,
+          charToSegmentForFragments,
+          plainText,
+          trimEnabledForFragments
+        )
 
         if (segmentFragments.length > 0) {
           ;(node as DOMElement & { _copyFragments?: CachedFragment[] })._copyFragments = segmentFragments
@@ -1579,84 +1597,132 @@ function dropSubtreeCache(node: DOMElement): void {
 }
 
 // Exported for testing
-export { applyStylesToWrappedText, buildCharToSegmentMap }
+export { applyStylesToWrappedText, buildCharToSegmentMap, computeFragmentsForWrappedText }
 
 /**
- * Compute per-row source-fragment ranges for an ink-text's segments.
+ * Compute per-row CachedFragment[] for an ink-text that has wrapped
+ * across multiple visual rows. Each segment carrying `copySourceFragment`
+ * emits one entry per visual row it touches.
  *
- * For each segment carrying `copySourceFragment`, walk the segment's
- * char range within plainText and emit one `CachedFragment` per visual
- * row the segment occupies. The softWrap array (one entry per char in
- * the FINAL wrapped text — note: same as plainText, since wrap inserts
- * '\n' soft breaks but plainText is pre-wrap; we read softWrap by char
- * index into plainText? actually softWrap is per visual row according
- * to wrapWithSoftWrap docs, indicating which rows are word-wrap
- * continuations) ...
+ * The `start`/`end` fields on each emitted fragment are the source byte
+ * range corresponding to JUST THIS ROW'S slice of the segment:
  *
- * Implementation: for v1, no soft-wrap handling — emit one fragment
- * per segment with `row=0`. When the text wraps, the fragment still
- * lives "on the first row" with colStart/colEnd. The hit-test only
- * uses fragments when (col,row) lands inside one; clicks on wrapped
- * continuation rows fall through to the block-level getOffset.
+ *  - For verbatim segments (rendered == source 1:1): `start` is the
+ *    segment's source-start plus the segment-relative offset where this
+ *    row begins; `end` is start + this-row's plain-text width. The
+ *    hit-test then maps within-row col linearly to source bytes via
+ *    `start + col` (clamped to end).
  *
- * For wrapped lines this means: partial selection of formatted text
- * that spans a wrap boundary degrades to block-level mapping. The
- * common case (a paragraph fitting on one screen row, or selecting
- * a whole formatted span that doesn't wrap) gets byte-exact source
- * via fragments. Acceptable trade-off — wrap-aware fragment splitting
- * needs the same width math we deliberately deleted from the host
- * earlier, and the hit-test fallback is the block's outerSource
- * (still correct for "select the whole paragraph" cases).
+ *  - For non-verbatim (formatted) segments: `start`/`end` are the WHOLE
+ *    segment's source byte range on every row. The hit-test snaps clicks
+ *    to start or end based on which half of the on-row width was hit,
+ *    so per-row identical bounds yields the same behavior — selections
+ *    inside formatted spans land on the span's source boundaries
+ *    regardless of which wrap-row was clicked. (Slicing source bytes
+ *    proportionally per row for formatted spans would be wrong: clicking
+ *    mid-row of a wrapped `$\sum_{i=1}^{n}$` math span has no defined
+ *    source-byte for that cell because the rendered glyph and source
+ *    char counts differ.)
+ *
+ * Mirrors `applyStylesToWrappedText`'s charIndex bookkeeping so the
+ * visual-cell ↔ source-char mapping stays exact through wrap-trim
+ * whitespace eating and through hard newlines in the original.
  */
-function computeSegmentFragments(
+function computeFragmentsForWrappedText(
+  wrappedPlain: string,
   segments: readonly StyledSegment[],
-  softWrap: boolean[] | undefined
+  charToSegment: readonly number[],
+  originalPlain: string,
+  trimEnabled: boolean
 ): CachedFragment[] {
   const out: CachedFragment[] = []
-  let visualCol = 0
+  const lines = wrappedPlain.split('\n')
 
-  for (const seg of segments) {
-    const segWidth = widestLine(seg.text)
-    const tag = seg.copySourceFragment
+  // Pre-compute each segment's char-start in originalPlain so we can
+  // convert (segment, charIndex) → segment-relative offset → source byte.
+  const segPlainStarts: number[] = []
 
-    if (tag) {
-      // Determine which row this segment STARTS on, given softWrap.
-      // softWrap[r] is true when visual row r is a word-wrap continuation
-      // of the previous source line. We need to walk the cumulative
-      // width across segments and map visualCol → row.
-      //
-      // Simplest correct-on-no-wrap path: if no softWrap, all segments
-      // live on row 0. The colStart is the running visualCol.
-      if (!softWrap || softWrap.length <= 1) {
-        out.push({
-          row: 0,
-          colStart: visualCol,
-          colEnd: visualCol + segWidth,
-          start: tag.start,
-          end: tag.end,
-          verbatim: tag.verbatim
-        })
+  {
+    let acc = 0
+
+    for (const seg of segments) {
+      segPlainStarts.push(acc)
+      acc += seg.text.length
+    }
+  }
+
+  let charIndex = 0
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx]!
+
+    let runStart = 0
+    let runSegIdx = charToSegment[charIndex] ?? 0
+    let runCharStart = charIndex
+
+    const flushRun = (visualEnd: number): void => {
+      if (visualEnd <= runStart) {
+        return
       }
-      // When wrap IS present: emit only the first-row portion of the
-      // segment. The continuation rows fall through to block-level
-      // mapping. Adequate for selecting any non-wrapped span.
-      else {
-        // Conservative: don't try to split across rows. Emit on row 0
-        // with the segment's leading width clamped to first-row capacity.
-        // Hit-test on wrap-continuation rows won't find the fragment,
-        // which is fine — block fallback handles it.
+
+      const seg = segments[runSegIdx]
+      const tag = seg?.copySourceFragment
+
+      if (tag) {
+        let start: number
+        let end: number
+
+        if (tag.verbatim) {
+          // For verbatim segments, the on-row source slice is the
+          // segment-relative offset (runCharStart - segPlainStart) +
+          // segment-source-start, length = visualEnd - runStart.
+          const segPlainStart = segPlainStarts[runSegIdx] ?? 0
+          const offsetInSeg = runCharStart - segPlainStart
+          const runLen = visualEnd - runStart
+
+          start = tag.start + offsetInSeg
+          end = Math.min(tag.end, start + runLen)
+        } else {
+          // Formatted segments use whole-segment bounds; the snap rule
+          // in copyPointAt picks start vs end based on which half of
+          // the on-row width was clicked.
+          start = tag.start
+          end = tag.end
+        }
+
         out.push({
-          row: 0,
-          colStart: visualCol,
-          colEnd: visualCol + segWidth,
-          start: tag.start,
-          end: tag.end,
+          row: lineIdx,
+          colStart: runStart,
+          colEnd: visualEnd,
+          start,
+          end,
           verbatim: tag.verbatim
         })
       }
     }
 
-    visualCol += segWidth
+    for (let i = 0; i < line.length; i++) {
+      const curSeg = charToSegment[charIndex] ?? runSegIdx
+
+      if (curSeg !== runSegIdx) {
+        flushRun(i)
+        runStart = i
+        runSegIdx = curSeg
+        runCharStart = charIndex
+      }
+
+      charIndex++
+    }
+
+    flushRun(line.length)
+
+    // Skip the inter-line char in originalPlain (real \n or wrap-trim
+    // whitespace) — same logic as applyStylesToWrappedText.
+    if (charIndex < originalPlain.length && originalPlain[charIndex] === '\n') {
+      charIndex++
+    } else if (trimEnabled && lineIdx < lines.length - 1 && /\s/.test(originalPlain[charIndex] ?? '')) {
+      charIndex++
+    }
   }
 
   return out

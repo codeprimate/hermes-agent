@@ -240,7 +240,11 @@ export function findRangeDom(root: DOMElement, id: number): DOMElement | null {
       continue
     }
 
-    const found = findRangeDom(child, id)
+    // The cast through `unknown` is to dodge a TS quirk: when this file
+    // is re-exported from the package's `index.d.ts` shim, the recursive
+    // `findRangeDom` call's return is inferred as `unknown` rather than
+    // the explicit `DOMElement | null` signature.
+    const found = findRangeDom(child as DOMElement, id) as DOMElement | null
 
     if (found) {
       return found
