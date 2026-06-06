@@ -2055,12 +2055,26 @@ def run_doctor(args):
         try:
             from plugins.memory.mem0 import _load_config as _load_mem0_config
             mem0_cfg = _load_mem0_config()
-            mem0_key = mem0_cfg.get("api_key", "")
-            if mem0_key:
-                check_ok("Mem0 API key configured")
-                check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+            mode = mem0_cfg.get("mode", "cloud")
+            if mode == "local":
+                ork = bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+                if ork:
+                    check_ok("Mem0 local mode — LLM key found")
+                    check_info(f"mode=local  user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+                else:
+                    _fail_and_issue(
+                        "Mem0 local mode — no LLM key",
+                        "(set OPENROUTER_API_KEY in .env)",
+                        "Mem0 is set to local mode but OPENROUTER_API_KEY is missing",
+                        issues,
+                    )
             else:
-                _fail_and_issue(
+                mem0_key = mem0_cfg.get("api_key", "")
+                if mem0_key:
+                    check_ok("Mem0 API key configured")
+                    check_info(f"user_id={mem0_cfg.get('user_id', '?')}  agent_id={mem0_cfg.get('agent_id', '?')}")
+                else:
+                    _fail_and_issue(
                     "Mem0 API key not set",
                     "(set MEM0_API_KEY in .env or run hermes memory setup)",
                     "Mem0 is set as memory provider but API key is missing",
