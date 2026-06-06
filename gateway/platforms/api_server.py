@@ -730,6 +730,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._memory_provider: Optional[Any] = None  # Lazily initialised Mem0 provider for /api/memory/*
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -849,8 +850,47 @@ class APIServerAdapter(BasePlatformAdapter):
         return origin
 
     # ------------------------------------------------------------------
-    # Auth helper
+    # Memory API — in-process Mem0 proxy
     # ------------------------------------------------------------------
+
+    def _setup_memory_provider(self) -> None:
+        """Create a Mem0MemoryProvider for the /api/memory/* endpoints.
+
+        Runs inside the gateway process so SQLite writes are single-owner
+        — no cross-process contention on history.db.
+        """
+        try:
+            from plugins.memory.mem0 import Mem0MemoryProvider
+            provider = Mem0MemoryProvider()
+            provider.initialize(session_id="api_server")
+            # The gateway IS the single writer for SQLite — never forward
+            # memory ops back to self via the HTTP proxy (recursive hang).
+            # Clear gateway_url from the loaded config so _get_local_client()
+            # creates a direct Memory() instance, not an _HttpMemoryProxy.
+            cfg = provider._config or {}
+            if cfg.pop("gateway_url", None):
+                logger.info(
+                    "[%s] Cleared gateway_url for in-process memory provider "
+                    "(gateway is the single writer)",
+                    self.name,
+                )
+            # Verify the provider is available before storing
+            if provider.is_available():
+                self._memory_provider = provider
+                logger.info(
+                    "[%s] Memory provider initialised for /api/memory/*",
+                    self.name,
+                )
+            else:
+                logger.warning(
+                    "[%s] Mem0 provider not available (no API key)",
+                    self.name,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to initialise memory provider: %s",
+                self.name, exc,
+            )
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
@@ -1027,6 +1067,71 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key=gateway_session_key,
         )
         return agent
+
+    # ------------------------------------------------------------------
+    # Memory API handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_memory_profile(self, request: "web.Request") -> "web.Response":
+        """POST /api/memory/profile — return all stored memories."""
+        auth_resp = self._check_auth(request)
+        if auth_resp:
+            return auth_resp
+        if self._memory_provider is None:
+            return web.json_response({"error": "Memory provider not available"}, status=503)
+        try:
+            result = self._memory_provider.handle_tool_call(
+                "mem0_profile", {},
+            )
+            return web.json_response(json.loads(result) if isinstance(result, str) else result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_memory_search(self, request: "web.Request") -> "web.Response":
+        """POST /api/memory/search — search memories by query."""
+        auth_resp = self._check_auth(request)
+        if auth_resp:
+            return auth_resp
+        if self._memory_provider is None:
+            return web.json_response({"error": "Memory provider not available"}, status=503)
+        try:
+            body = await request.json()
+            result = self._memory_provider.handle_tool_call(
+                "mem0_search", {
+                    "query": body.get("query", ""),
+                    "rerank": body.get("rerank", False),
+                    "top_k": body.get("top_k", 10),
+                },
+            )
+            return web.json_response(json.loads(result) if isinstance(result, str) else result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_memory_conclude(self, request: "web.Request") -> "web.Response":
+        """POST /api/memory/conclude — store a fact."""
+        auth_resp = self._check_auth(request)
+        if auth_resp:
+            return auth_resp
+        if self._memory_provider is None:
+            return web.json_response({"error": "Memory provider not available"}, status=503)
+        try:
+            body = await request.json()
+            conclusion = body.get("conclusion", "")
+            if not conclusion:
+                return web.json_response({"error": "Missing 'conclusion'"}, status=400)
+            result = self._memory_provider.handle_tool_call(
+                "mem0_conclude", {"conclusion": conclusion},
+            )
+            return web.json_response(json.loads(result) if isinstance(result, str) else result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_memory_delete(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/memory — clear all memories for the current user."""
+        auth_resp = self._check_auth(request)
+        if auth_resp:
+            return auth_resp
+        return web.json_response({"error": "Not implemented"}, status=501)
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -4140,6 +4245,17 @@ class APIServerAdapter(BasePlatformAdapter):
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
+
+            # Memory API — single-writer proxy for cross-process calls
+            self._app.router.add_post("/api/memory/profile", self._handle_memory_profile)
+            self._app.router.add_post("/api/memory/search", self._handle_memory_search)
+            self._app.router.add_post("/api/memory/conclude", self._handle_memory_conclude)
+            self._app.router.add_delete("/api/memory", self._handle_memory_delete)
+
+            # Initialise the in-process Mem0 provider for /api/memory/* endpoints.
+            # This runs inside the gateway process, so its SQLite connection is the
+            # only writer — no cross-process contention.
+            self._setup_memory_provider()
             # upstream session-control handlers.
             self._app["api_server_adapter"] = self
 
