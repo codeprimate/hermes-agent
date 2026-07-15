@@ -23,6 +23,10 @@ Environment variables:
     MATRIX_DM_AUTO_THREAD       Auto-create threads for DM messages (default: false)
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
+    MATRIX_ALLOW_BOTS           How to handle bot messages (m.notice):
+                                "none"     — ignore all bot messages (default)
+                                "mentions" — accept bot messages only when they @mention us
+                                "all"      — accept all bot messages
 """
 
 from __future__ import annotations
@@ -530,6 +534,15 @@ class MatrixAdapter(BasePlatformAdapter):
         # if that changes, add a config.yaml entry rather than an env var.
         self._reaction_redaction_delay_seconds = 5.0
         self._reaction_redaction_tasks: Set[asyncio.Task] = set()
+
+        # Bot message filtering (MATRIX_ALLOW_BOTS / config allow_bots):
+        #   "none"     — ignore all m.notice messages (default, backward-compatible)
+        #   "mentions" — accept m.notice only when they @mention us
+        #   "all"      — accept all m.notice messages
+        allow_bots = config.extra.get("allow_bots", "")
+        if not allow_bots:
+            allow_bots = os.getenv("MATRIX_ALLOW_BOTS", "none")
+        self._allow_bots = str(allow_bots).lower().strip()
 
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
@@ -1755,10 +1768,17 @@ class MatrixAdapter(BasePlatformAdapter):
         if relates_to.get("rel_type") == "m.replace":
             return
 
-        # Ignore m.notice to prevent bot-to-bot loops (m.notice is the
-        # conventional msgtype for bot responses in the Matrix ecosystem).
+        # Bot message filtering (MATRIX_ALLOW_BOTS / config allow_bots):
+        #   "none"     — ignore all m.notice messages (default, backward-compatible)
+        #   "mentions" — accept m.notice only when they @mention us
+        #   "all"      — accept all m.notice messages
         if msgtype == "m.notice":
-            return
+            if self._allow_bots == "none":
+                return
+            elif self._allow_bots == "mentions":
+                # Let through — mention gating in _resolve_message_context handles it
+                pass
+            # "all" falls through to normal dispatch
 
         # Dispatch by msgtype.
         media_msgtypes = ("m.image", "m.audio", "m.video", "m.file")

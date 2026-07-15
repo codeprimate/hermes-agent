@@ -91,6 +91,7 @@ dependencies = [
   "uvicorn[standard]>=0.24.0,<1",
   "ptyprocess>=0.7.0,<1; sys_platform != 'win32'",
   "pywinpty>=2.0.0,<3; sys_platform == 'win32'",
+  "mautrix>=0.21.0",
 ]
 
 [project.optional-dependencies]

@@ -158,7 +158,7 @@ class _HttpMemoryProxy:
         results = data.get("results", data.get("result", []))
         if isinstance(results, str):
             return []
-        return [type("Hit", (), {"id": "", "payload": {"data": r["memory"]}, "score": r.get("score", 0)})()  # noqa
+        return [{"memory": r.get("memory", ""), "score": r.get("score", 0), "id": r.get("id", "")}
                 if isinstance(r, dict) else r for r in results]
 
     def get_all(self, *, filters=None, **kwargs):
@@ -422,8 +422,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     "embedding_model_dims": emb_dims,
                 }
             else:
-                # Server mode — ensure Qdrant is healthy before creating client
-                self._ensure_qdrant_healthy()
+                # Server mode — build Qdrant host:port config
                 vs_config = {
                     "host": cfg.get("qdrant_host", "127.0.0.1"),
                     "port": int(cfg.get("qdrant_port", 6333)),
@@ -476,54 +475,6 @@ class Mem0MemoryProvider(MemoryProvider):
                 except Exception:
                     pass
                 self._client = None
-
-    def _ensure_qdrant_healthy(self) -> bool:
-        """Verify Qdrant server is reachable, attempting recovery if not.
-
-        In server mode (vector_store_path empty), the mem0 library's
-        Memory.from_config() will try to connect to the Qdrant server.
-        If the server is down, the Memory init will fail with a connection
-        error. This method proactively checks health and restarts the
-        Qdrant container via the ensure_qdrant.sh script before we
-        attempt to create the client.
-
-        Returns True if Qdrant is healthy, False if unreachable.
-        """
-        cfg = self._config or {}
-        vs_path = cfg.get("vector_store_path", "")
-
-        # Only applies in server mode
-        if vs_path:
-            return True
-
-        health_url = cfg.get("qdrant_health_url", "http://127.0.0.1:6333/healthz")
-
-        # Fast check — is it already healthy?
-        try:
-            import urllib.request
-            resp = urllib.request.urlopen(health_url, timeout=2)
-            if resp.status == 200:
-                return True
-        except Exception:
-            pass
-
-        # Not healthy — run recovery script
-        logger.warning("Qdrant health check failed. Running recovery protocol...")
-        try:
-            script = os.path.expanduser("~/services/hermes-shard/scripts/ensure_qdrant.sh")
-            result = subprocess.run(
-                [script, "--wait", "30"],
-                capture_output=True, text=True, timeout=45,
-            )
-            if result.returncode in (0, 1):
-                logger.info("Qdrant recovery succeeded (script exit %d).", result.returncode)
-                return True
-            logger.error("Qdrant recovery failed (script exit %d): %s",
-                         result.returncode, result.stderr.strip())
-        except Exception as e:
-            logger.error("Qdrant recovery script failed: %s", e)
-
-        return False
 
     def _is_breaker_open(self) -> bool:
         """Return True if the circuit breaker is tripped (too many failures).
@@ -660,18 +611,6 @@ class Mem0MemoryProvider(MemoryProvider):
             return json.dumps({
                 "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
             })
-
-        if tool_name in ("mem0_profile", "mem0_search", "mem0_conclude"):
-            # For Qdrant server mode, verify health before every operation
-            cfg = self._config or {}
-            if not cfg.get("vector_store_path", ""):
-                if not self._ensure_qdrant_healthy():
-                    return tool_error(
-                        "Qdrant vector store is not available. "
-                        "Memory operations are temporarily disabled. "
-                        "The recovery protocol has been attempted — check "
-                        "~/.hermes/logs/errors.log for details."
-                    )
 
         try:
             client = self._get_client()
